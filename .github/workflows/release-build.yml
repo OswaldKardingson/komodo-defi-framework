@@ -1,32 +1,110 @@
 name: Release builds
+
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      kdf_ref:
+        description: Optional KDF commit, tag, or branch to build. Defaults to the workflow commit.
+        required: false
+        type: string
+
+permissions:
+  contents: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+  CARGO_TERM_COLOR: always
+  KDF_SOURCE_REF: ${{ github.event.inputs.kdf_ref || github.sha }}
 
 jobs:
+  metadata:
+    name: Release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      build_tag: ${{ steps.metadata.outputs.build_tag }}
+      source_sha: ${{ steps.metadata.outputs.source_sha }}
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+      release_name: ${{ steps.metadata.outputs.release_name }}
+      kdf_version: ${{ steps.metadata.outputs.kdf_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.KDF_SOURCE_REF }}
+
+      - id: metadata
+        name: Calculate release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_tag="$(git rev-parse --short=7 HEAD)"
+          source_sha="$(git rev-parse HEAD)"
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' mm2src/mm2_bin_lib/Cargo.toml | head -1)"
+          release_tag="kdf-v${version}-${build_tag}"
+          {
+            echo "build_tag=$build_tag"
+            echo "source_sha=$source_sha"
+            echo "release_tag=$release_tag"
+            echo "release_name=KDF ${version} (${build_tag})"
+            echo "kdf_version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  quality-gate:
+    name: Format, lint, and test
+    runs-on: ubuntu-latest
+    needs: metadata
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KDF_SOURCE_REF }}
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --no-self-update --profile=minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Install build deps
+        uses: ./.github/actions/deps-install
+        with:
+          deps: ('protoc' 'libudev-dev')
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run unit tests
+        run: cargo test --bins --lib --no-fail-fast
+
   linux-x86-64:
-    timeout-minutes: 60
+    name: Linux x86-64 executable
     runs-on: ubuntu-latest
     container: komodoofficial/ci-container:latest
+    needs: [metadata, quality-gate]
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KDF_SOURCE_REF }}
 
-      - name: pre scripts for ci container
+      - name: Prepare CI container
         run: |
-          git config --global --add safe.directory /__w/komodo-defi-framework/komodo-defi-framework
-          echo "/bin" >> $GITHUB_PATH
-          echo "/usr/bin" >> $GITHUB_PATH
-          echo "/root/.cargo/bin" >> $GITHUB_PATH
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "/bin" >> "$GITHUB_PATH"
+          echo "/usr/bin" >> "$GITHUB_PATH"
+          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Install toolchain
+      - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --no-self-update --profile=minimal
           rustup default stable
@@ -36,55 +114,37 @@ jobs:
         with:
           deps: ('protoc')
 
-      - name: Calculate build tag (commit hash) for PR commit
-        if: github.event_name == 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 ${{ github.event.pull_request.head.sha }})" >> $GITHUB_ENV
-
-      - name: Calculate build tag (commit hash) for merge commit
-        if: github.event_name != 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
-
-      - name: Build cache
-        uses: ./.github/actions/build-cache
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --package mm2_bin_lib
 
-      - name: Compress kdf build output
+      - name: Package
+        shell: bash
         run: |
-          NAME="kdf_$KDF_BUILD_TAG-linux-x86-64.zip"
-          zip $NAME target/release/kdf -j
-          SAFE_DIR_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          mkdir $SAFE_DIR_NAME
-          mv $NAME ./$SAFE_DIR_NAME/
+          set -euo pipefail
+          name="kdf_${{ needs.metadata.outputs.build_tag }}-linux-x86-64.zip"
+          mkdir -p dist
+          zip -j "dist/$name" target/release/kdf
+          (cd dist && sha256sum "$name" > "$name.sha256")
 
-      - name: Upload build artifact
-        env:
-          FILE_SERVER_HOST: ${{ secrets.FILE_SERVER_HOST }}
-          FILE_SERVER_USERNAME: ${{ secrets.FILE_SERVER_USERNAME }}
-          FILE_SERVER_PORT: ${{ secrets.FILE_SERVER_PORT }}
-          FILE_SERVER_KEY: ${{ secrets.FILE_SERVER_KEY }}
-        if: ${{ env.FILE_SERVER_KEY != '' }}
-        run: |
-          SAFE_BRANCH_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          python3 ./scripts/ci/upload_artifact.py "$SAFE_BRANCH_NAME" "/uploads/$SAFE_BRANCH_NAME"
-
-      - name: Login to dockerhub
-        run: docker login --username ${{ secrets.DOCKER_HUB_USERNAME }} --password ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}  docker.io
-
-      - name: Build and push container image
-        run: |
-          export CONTAINER_TAG=$(./target/release/kdf --version | awk '{print $3}')
-          docker build -t komodoofficial/komodo-defi-framework:"$CONTAINER_TAG" -t komodoofficial/komodo-defi-framework:main-latest -f .docker/Dockerfile.release .
-          docker push komodoofficial/komodo-defi-framework:"$CONTAINER_TAG"
-          docker push komodoofficial/komodo-defi-framework:main-latest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kdf-linux-x86-64
+          path: dist/*
+          if-no-files-found: error
 
   mac-x86-64:
-    timeout-minutes: 60
+    name: macOS x86-64 executable
     runs-on: macos-latest
+    needs: [metadata, quality-gate]
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v3
-      - name: Install toolchain
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KDF_SOURCE_REF }}
+
+      - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --no-self-update --profile=minimal
           rustup default stable
@@ -93,53 +153,30 @@ jobs:
       - name: Install build deps
         uses: ./.github/actions/deps-install
         with:
-          deps: ('protoc', 'python3', 'paramiko')
+          deps: ('protoc')
 
-      - name: Calculate build tag (commit hash) for PR commit
-        if: github.event_name == 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 ${{ github.event.pull_request.head.sha }})" >> $GITHUB_ENV
-
-      - name: Calculate build tag (commit hash) for merge commit
-        if: github.event_name != 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
-
-      - name: Build cache
-        uses: ./.github/actions/build-cache
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --target x86_64-apple-darwin
+        run: cargo build --release --package mm2_bin_lib --target x86_64-apple-darwin
 
-      - name: Upload build for next job
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: x86_64-apple-darwin-release-kdf
+          name: mac-x86-64-kdf-bin
           path: target/x86_64-apple-darwin/release/kdf
-
-      - name: Compress kdf build output
-        run: |
-          NAME="kdf_$KDF_BUILD_TAG-mac-x86-64.zip"
-          zip $NAME target/x86_64-apple-darwin/release/kdf -j
-          SAFE_DIR_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          mkdir $SAFE_DIR_NAME
-          mv $NAME ./$SAFE_DIR_NAME/
-
-      - name: Upload build artifact
-        env:
-          FILE_SERVER_HOST: ${{ secrets.FILE_SERVER_HOST }}
-          FILE_SERVER_USERNAME: ${{ secrets.FILE_SERVER_USERNAME }}
-          FILE_SERVER_PORT: ${{ secrets.FILE_SERVER_PORT }}
-          FILE_SERVER_KEY: ${{ secrets.FILE_SERVER_KEY }}
-        if: ${{ env.FILE_SERVER_KEY != '' }}
-        run: |
-          SAFE_BRANCH_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          python3 ./scripts/ci/upload_artifact.py "$SAFE_BRANCH_NAME" "/uploads/$SAFE_BRANCH_NAME"
+          if-no-files-found: error
 
   mac-arm64:
-    timeout-minutes: 60
+    name: macOS arm64 executable
     runs-on: macos-latest
+    needs: [metadata, quality-gate]
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v3
-      - name: Install toolchain
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KDF_SOURCE_REF }}
+
+      - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --no-self-update --profile=minimal
           rustup default stable
@@ -148,277 +185,108 @@ jobs:
       - name: Install build deps
         uses: ./.github/actions/deps-install
         with:
-          deps: ('protoc', 'python3', 'paramiko')
+          deps: ('protoc')
 
-      - name: Calculate build tag (commit hash) for PR commit
-        if: github.event_name == 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 ${{ github.event.pull_request.head.sha }})" >> $GITHUB_ENV
-
-      - name: Calculate build tag (commit hash) for merge commit
-        if: github.event_name != 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
-
-      - name: Build cache
-        uses: ./.github/actions/build-cache
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --target aarch64-apple-darwin
+        run: cargo build --release --package mm2_bin_lib --target aarch64-apple-darwin
 
-      - name: Upload build for next job
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: aarch64-apple-darwin-release-kdf
+          name: mac-arm64-kdf-bin
           path: target/aarch64-apple-darwin/release/kdf
-
-      - name: Compress kdf build output
-        run: |
-          NAME="kdf_$KDF_BUILD_TAG-mac-arm64.zip"
-          zip $NAME target/aarch64-apple-darwin/release/kdf -j
-          SAFE_DIR_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          mkdir $SAFE_DIR_NAME
-          mv $NAME ./$SAFE_DIR_NAME/
-
-      - name: Upload build artifact
-        env:
-          FILE_SERVER_HOST: ${{ secrets.FILE_SERVER_HOST }}
-          FILE_SERVER_USERNAME: ${{ secrets.FILE_SERVER_USERNAME }}
-          FILE_SERVER_PORT: ${{ secrets.FILE_SERVER_PORT }}
-          FILE_SERVER_KEY: ${{ secrets.FILE_SERVER_KEY }}
-        if: ${{ env.FILE_SERVER_KEY != '' }}
-        run: |
-          SAFE_BRANCH_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          python3 ./scripts/ci/upload_artifact.py "$SAFE_BRANCH_NAME" "/uploads/$SAFE_BRANCH_NAME"
+          if-no-files-found: error
 
   mac-universal:
-    timeout-minutes: 60
+    name: macOS universal executable
     runs-on: macos-latest
-    needs: [mac-x86-64, mac-arm64]
+    needs: [metadata, mac-x86-64, mac-arm64]
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
-
-      - name: Install build deps
-        uses: ./.github/actions/deps-install
+      - uses: actions/download-artifact@v4
         with:
-          deps: ('protoc', 'python3', 'paramiko')
-
-      - name: Calculate build tag (commit hash) for PR commit
-        if: github.event_name == 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 ${{ github.event.pull_request.head.sha }})" >> $GITHUB_ENV
-
-      - name: Calculate build tag (commit hash) for merge commit
-        if: github.event_name != 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
-
-      - name: Download macos x86_64 build
-        uses: actions/download-artifact@v5
-        with:
-          name: x86_64-apple-darwin-release-kdf
+          name: mac-x86-64-kdf-bin
           path: target/x86_64-apple-darwin/release
 
-      - name: Download macos aarch64 build
-        uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v4
         with:
-          name: aarch64-apple-darwin-release-kdf
+          name: mac-arm64-kdf-bin
           path: target/aarch64-apple-darwin/release
 
-      - name: Make universal kdf build output
+      - name: Package universal binary
+        shell: bash
         run: |
-          AARCH64_BIN="target/aarch64-apple-darwin/release/kdf"
-          X86_64_BIN="target/x86_64-apple-darwin/release/kdf"
-          OUT_DIR="target/universal-apple-darwin/release"
-          OUT_BIN="$OUT_DIR/kdf"
-          mkdir -p "$OUT_DIR"
-          lipo -create "$AARCH64_BIN" "$X86_64_BIN" -output "$OUT_BIN"
-          lipo -info "$OUT_BIN"
+          set -euo pipefail
+          aarch64_bin="target/aarch64-apple-darwin/release/kdf"
+          x86_64_bin="target/x86_64-apple-darwin/release/kdf"
+          out_dir="target/universal-apple-darwin/release"
+          out_bin="$out_dir/kdf"
+          name="kdf_${{ needs.metadata.outputs.build_tag }}-mac-universal.zip"
+          mkdir -p "$out_dir" dist
+          chmod +x "$aarch64_bin" "$x86_64_bin"
+          lipo -create "$aarch64_bin" "$x86_64_bin" -output "$out_bin"
+          lipo -info "$out_bin"
+          zip -j "dist/$name" "$out_bin"
+          (cd dist && shasum -a 256 "$name" > "$name.sha256")
 
-      - name: Compress kdf build output
-        env:
-          AVAILABLE: ${{ secrets.FILE_SERVER_KEY }}
-        if: ${{ env.AVAILABLE != '' }}
-        run: |
-          NAME="kdf_$KDF_BUILD_TAG-mac-universal.zip"
-          zip $NAME target/universal-apple-darwin/release/kdf -j
-          SAFE_DIR_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          mkdir $SAFE_DIR_NAME
-          mv $NAME ./$SAFE_DIR_NAME/
-
-      - name: Upload build artifact
-        env:
-          FILE_SERVER_HOST: ${{ secrets.FILE_SERVER_HOST }}
-          FILE_SERVER_USERNAME: ${{ secrets.FILE_SERVER_USERNAME }}
-          FILE_SERVER_PORT: ${{ secrets.FILE_SERVER_PORT }}
-          FILE_SERVER_KEY: ${{ secrets.FILE_SERVER_KEY }}
-        if: ${{ env.FILE_SERVER_KEY != '' }}
-        run: |
-          SAFE_BRANCH_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          python3 ./scripts/ci/upload_artifact.py "$SAFE_BRANCH_NAME" "/uploads/$SAFE_BRANCH_NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kdf-mac-universal
+          path: dist/*
+          if-no-files-found: error
 
   win-x86-64:
-    timeout-minutes: 60
+    name: Windows x86-64 executable
     runs-on: windows-latest
+    needs: [metadata, quality-gate]
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v3
-      - name: Install toolchain
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KDF_SOURCE_REF }}
+
+      - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --no-self-update --profile=minimal
           rustup default stable
-
-      - name: Install build deps
-        uses: ./.github/actions/deps-install
-        with:
-          deps: ('protoc', 'python3', 'paramiko')
-
-      - name: Calculate build tag (commit hash) for PR commit
-        if: github.event_name == 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 ${{ github.event.pull_request.head.sha }})" >> $Env:GITHUB_ENV
-
-      - name: Calculate build tag (commit hash) for merge commit
-        if: github.event_name != 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 HEAD)" >> $Env:GITHUB_ENV
-
-      - name: Build cache
-        uses: ./.github/actions/build-cache
-
-      - name: Build
-        run: cargo build --release
-
-      - name: Compress kdf build output
-        run: |
-          $NAME="kdf_$Env:KDF_BUILD_TAG-win-x86-64.zip"
-          7z a $NAME .\target\release\kdf.exe .\target\release\*.dll
-          $SAFE_DIR_NAME = $Env:BRANCH_NAME -replace '/', '-'
-          mkdir $SAFE_DIR_NAME
-          mv $NAME ./$SAFE_DIR_NAME/
-
-      - name: Upload build artifact
-        env:
-          FILE_SERVER_HOST: ${{ secrets.FILE_SERVER_HOST }}
-          FILE_SERVER_USERNAME: ${{ secrets.FILE_SERVER_USERNAME }}
-          FILE_SERVER_PORT: ${{ secrets.FILE_SERVER_PORT }}
-          FILE_SERVER_KEY: ${{ secrets.FILE_SERVER_KEY }}
-        if: ${{ env.FILE_SERVER_KEY != '' }}
-        run: |
-          $SAFE_BRANCH_NAME = $Env:BRANCH_NAME -replace '/', '-'
-          python3 ./scripts/ci/upload_artifact.py "$SAFE_BRANCH_NAME" "/uploads/$SAFE_BRANCH_NAME"
-
-  mac-dylib-x86-64:
-    timeout-minutes: 60
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Install toolchain
-        run: |
-          rustup toolchain install stable --no-self-update --profile=minimal
-          rustup default stable
-          rustup target add x86_64-apple-darwin
-
-      - name: Install build deps
-        uses: ./.github/actions/deps-install
-        with:
-          deps: ('protoc', 'python3', 'paramiko')
-
-      - name: Calculate build tag (commit hash) for PR commit
-        if: github.event_name == 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 ${{ github.event.pull_request.head.sha }})" >> $GITHUB_ENV
-
-      - name: Calculate build tag (commit hash) for merge commit
-        if: github.event_name != 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
-
-      - name: Build cache
-        uses: ./.github/actions/build-cache
-
-      - name: Build
-        run: cargo rustc --target x86_64-apple-darwin --lib --release --package mm2_bin_lib --crate-type=staticlib
-
-      - name: Compress kdf build output
-        run: |
-          NAME="kdf_$KDF_BUILD_TAG-mac-dylib-x86-64.zip"
-          mv target/x86_64-apple-darwin/release/libkdflib.a target/x86_64-apple-darwin/release/libkdf.a
-          zip $NAME target/x86_64-apple-darwin/release/libkdf.a -j
-          SAFE_DIR_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          mkdir $SAFE_DIR_NAME
-          mv $NAME ./$SAFE_DIR_NAME/
-
-      - name: Upload build artifact
-        env:
-          FILE_SERVER_HOST: ${{ secrets.FILE_SERVER_HOST }}
-          FILE_SERVER_USERNAME: ${{ secrets.FILE_SERVER_USERNAME }}
-          FILE_SERVER_PORT: ${{ secrets.FILE_SERVER_PORT }}
-          FILE_SERVER_KEY: ${{ secrets.FILE_SERVER_KEY }}
-        if: ${{ env.FILE_SERVER_KEY != '' }}
-        run: |
-          SAFE_BRANCH_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          python3 ./scripts/ci/upload_artifact.py "$SAFE_BRANCH_NAME" "/uploads/$SAFE_BRANCH_NAME"
-
-  wasm:
-    timeout-minutes: 60
-    runs-on: ubuntu-latest
-    container: komodoofficial/ci-container:latest
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: pre scripts for ci container
-        run: |
-          git config --global --add safe.directory /__w/komodo-defi-framework/komodo-defi-framework
-          echo "/bin" >> $GITHUB_PATH
-          echo "/usr/bin" >> $GITHUB_PATH
-          echo "/root/.cargo/bin" >> $GITHUB_PATH
 
       - name: Install build deps
         uses: ./.github/actions/deps-install
         with:
           deps: ('protoc')
 
-      - name: Install toolchain
-        run: |
-          rustup toolchain install stable --no-self-update --profile=minimal
-          rustup default stable
-          rustup target add wasm32-unknown-unknown
-
-      - name: Install wasm-pack
-        # TODO: Lock wasm-pack version
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
-      - name: Calculate build tag (commit hash) for PR commit
-        if: github.event_name == 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 ${{ github.event.pull_request.head.sha }})" >> $GITHUB_ENV
-
-      - name: Calculate build tag (commit hash) for merge commit
-        if: github.event_name != 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
-
-      - name: Build cache
-        uses: ./.github/actions/build-cache
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: wasm-pack build --release mm2src/mm2_bin_lib --target web --out-dir ../../target/target-wasm-release
+        run: cargo build --release --package mm2_bin_lib
 
-      - name: Compress build output
+      - name: Package
+        shell: powershell
         run: |
-          NAME="kdf_$KDF_BUILD_TAG-wasm.zip"
-          (cd ./target/target-wasm-release && zip -r - .) > $NAME
-          SAFE_DIR_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          mkdir $SAFE_DIR_NAME
-          mv $NAME ./$SAFE_DIR_NAME/
+          $name = "kdf_${{ needs.metadata.outputs.build_tag }}-win-x86-64.zip"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          7z a "dist\$name" ".\target\release\kdf.exe" ".\target\release\*.dll"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist\$name").Hash.ToLower()
+          "$hash  $name" | Out-File -FilePath "dist\$name.sha256" -Encoding ascii
 
-      - name: Upload build artifact
-        env:
-          FILE_SERVER_HOST: ${{ secrets.FILE_SERVER_HOST }}
-          FILE_SERVER_USERNAME: ${{ secrets.FILE_SERVER_USERNAME }}
-          FILE_SERVER_PORT: ${{ secrets.FILE_SERVER_PORT }}
-          FILE_SERVER_KEY: ${{ secrets.FILE_SERVER_KEY }}
-        if: ${{ env.FILE_SERVER_KEY != '' }}
-        run: |
-          SAFE_BRANCH_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          python3 ./scripts/ci/upload_artifact.py "$SAFE_BRANCH_NAME" "/uploads/$SAFE_BRANCH_NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kdf-win-x86-64
+          path: dist/*
+          if-no-files-found: error
 
   ios-aarch64:
-    timeout-minutes: 60
+    name: iOS arm64 static library
     runs-on: macos-latest
+    needs: [metadata, quality-gate]
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v3
-      - name: Install toolchain
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KDF_SOURCE_REF }}
+
+      - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --no-self-update --profile=minimal
           rustup default stable
@@ -427,57 +295,48 @@ jobs:
       - name: Install build deps
         uses: ./.github/actions/deps-install
         with:
-          deps: ('protoc', 'python3', 'paramiko')
+          deps: ('protoc')
 
-      - name: Calculate build tag (commit hash) for PR commit
-        if: github.event_name == 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 ${{ github.event.pull_request.head.sha }})" >> $GITHUB_ENV
-
-      - name: Calculate build tag (commit hash) for merge commit
-        if: github.event_name != 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
-
-      - name: Build cache
-        uses: ./.github/actions/build-cache
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build
         run: cargo rustc --target aarch64-apple-ios --lib --release --package mm2_bin_lib --crate-type=staticlib
 
-      - name: Compress kdf build output
+      - name: Package
+        shell: bash
         run: |
-          NAME="kdf_$KDF_BUILD_TAG-ios-aarch64.zip"
-          mv target/aarch64-apple-ios/release/libkdflib.a target/aarch64-apple-ios/release/libkdf.a
-          zip $NAME target/aarch64-apple-ios/release/libkdf.a -j
-          SAFE_DIR_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          mkdir $SAFE_DIR_NAME
-          mv $NAME ./$SAFE_DIR_NAME/
+          set -euo pipefail
+          name="kdf_${{ needs.metadata.outputs.build_tag }}-ios-aarch64.zip"
+          mkdir -p dist
+          cp target/aarch64-apple-ios/release/libkdflib.a target/aarch64-apple-ios/release/libkdf.a
+          zip -j "dist/$name" target/aarch64-apple-ios/release/libkdf.a
+          (cd dist && shasum -a 256 "$name" > "$name.sha256")
 
-      - name: Upload build artifact
-        env:
-          FILE_SERVER_HOST: ${{ secrets.FILE_SERVER_HOST }}
-          FILE_SERVER_USERNAME: ${{ secrets.FILE_SERVER_USERNAME }}
-          FILE_SERVER_PORT: ${{ secrets.FILE_SERVER_PORT }}
-          FILE_SERVER_KEY: ${{ secrets.FILE_SERVER_KEY }}
-        if: ${{ env.FILE_SERVER_KEY != '' }}
-        run: |
-          SAFE_BRANCH_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          python3 ./scripts/ci/upload_artifact.py "$SAFE_BRANCH_NAME" "/uploads/$SAFE_BRANCH_NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kdf-ios-aarch64
+          path: dist/*
+          if-no-files-found: error
 
   android-aarch64:
-    timeout-minutes: 60
+    name: Android arm64 static library
     runs-on: ubuntu-latest
     container: komodoofficial/ci-container:latest
+    needs: [metadata, quality-gate]
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KDF_SOURCE_REF }}
 
-      - name: pre scripts for ci container
+      - name: Prepare CI container
         run: |
-          git config --global --add safe.directory /__w/komodo-defi-framework/komodo-defi-framework
-          echo "/bin" >> $GITHUB_PATH
-          echo "/usr/bin" >> $GITHUB_PATH
-          echo "/root/.cargo/bin" >> $GITHUB_PATH
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "/bin" >> "$GITHUB_PATH"
+          echo "/usr/bin" >> "$GITHUB_PATH"
+          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Install toolchain
+      - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --no-self-update --profile=minimal
           rustup default stable
@@ -491,57 +350,50 @@ jobs:
       - name: Setup NDK
         run: ./scripts/ci/android-ndk.sh x86 23
 
-      - name: Calculate build tag (commit hash) for PR commit
-        if: github.event_name == 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 ${{ github.event.pull_request.head.sha }})" >> $GITHUB_ENV
-
-      - name: Calculate build tag (commit hash) for merge commit
-        if: github.event_name != 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
-
-      - name: Build cache
-        uses: ./.github/actions/build-cache
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build
         run: |
-          export PATH=$PATH:/android-ndk/bin
-          CC_aarch64_linux_android=aarch64-linux-android21-clang CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=aarch64-linux-android21-clang cargo rustc --target=aarch64-linux-android --lib --release --crate-type=staticlib --package mm2_bin_lib
+          export PATH="$PATH:/android-ndk/bin"
+          CC_aarch64_linux_android=aarch64-linux-android21-clang \
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=aarch64-linux-android21-clang \
+          cargo rustc --target=aarch64-linux-android --lib --release --crate-type=staticlib --package mm2_bin_lib
 
-      - name: Compress kdf build output
+      - name: Package
+        shell: bash
         run: |
-          NAME="kdf_$KDF_BUILD_TAG-android-aarch64.zip"
-          mv target/aarch64-linux-android/release/libkdflib.a target/aarch64-linux-android/release/libkdf.a
-          zip $NAME target/aarch64-linux-android/release/libkdf.a  -j
-          SAFE_DIR_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          mkdir $SAFE_DIR_NAME
-          mv $NAME ./$SAFE_DIR_NAME/
+          set -euo pipefail
+          name="kdf_${{ needs.metadata.outputs.build_tag }}-android-aarch64.zip"
+          mkdir -p dist
+          cp target/aarch64-linux-android/release/libkdflib.a target/aarch64-linux-android/release/libkdf.a
+          zip -j "dist/$name" target/aarch64-linux-android/release/libkdf.a
+          (cd dist && sha256sum "$name" > "$name.sha256")
 
-      - name: Upload build artifact
-        env:
-          FILE_SERVER_HOST: ${{ secrets.FILE_SERVER_HOST }}
-          FILE_SERVER_USERNAME: ${{ secrets.FILE_SERVER_USERNAME }}
-          FILE_SERVER_PORT: ${{ secrets.FILE_SERVER_PORT }}
-          FILE_SERVER_KEY: ${{ secrets.FILE_SERVER_KEY }}
-        if: ${{ env.FILE_SERVER_KEY != '' }}
-        run: |
-          SAFE_BRANCH_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          python3 ./scripts/ci/upload_artifact.py "$SAFE_BRANCH_NAME" "/uploads/$SAFE_BRANCH_NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kdf-android-aarch64
+          path: dist/*
+          if-no-files-found: error
 
   android-armv7:
-    timeout-minutes: 60
+    name: Android armv7 static library
     runs-on: ubuntu-latest
     container: komodoofficial/ci-container:latest
+    needs: [metadata, quality-gate]
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KDF_SOURCE_REF }}
 
-      - name: pre scripts for ci container
+      - name: Prepare CI container
         run: |
-          git config --global --add safe.directory /__w/komodo-defi-framework/komodo-defi-framework
-          echo "/bin" >> $GITHUB_PATH
-          echo "/usr/bin" >> $GITHUB_PATH
-          echo "/root/.cargo/bin" >> $GITHUB_PATH
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "/bin" >> "$GITHUB_PATH"
+          echo "/usr/bin" >> "$GITHUB_PATH"
+          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Install toolchain
+      - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --no-self-update --profile=minimal
           rustup default stable
@@ -555,38 +407,178 @@ jobs:
       - name: Setup NDK
         run: ./scripts/ci/android-ndk.sh x86 23
 
-      - name: Calculate build tag (commit hash) for PR commit
-        if: github.event_name == 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 ${{ github.event.pull_request.head.sha }})" >> $GITHUB_ENV
-
-      - name: Calculate build tag (commit hash) for merge commit
-        if: github.event_name != 'pull_request'
-        run: echo "KDF_BUILD_TAG=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
-
-      - name: Build cache
-        uses: ./.github/actions/build-cache
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build
         run: |
-          export PATH=$PATH:/android-ndk/bin
-          CC_armv7_linux_androideabi=armv7a-linux-androideabi21-clang CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=armv7a-linux-androideabi21-clang cargo rustc --target=armv7-linux-androideabi --lib --release --crate-type=staticlib --package mm2_bin_lib
+          export PATH="$PATH:/android-ndk/bin"
+          CC_armv7_linux_androideabi=armv7a-linux-androideabi21-clang \
+          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=armv7a-linux-androideabi21-clang \
+          cargo rustc --target=armv7-linux-androideabi --lib --release --crate-type=staticlib --package mm2_bin_lib
 
-      - name: Compress kdf build output
+      - name: Package
+        shell: bash
         run: |
-          NAME="kdf_$KDF_BUILD_TAG-android-armv7.zip"
-          mv target/armv7-linux-androideabi/release/libkdflib.a target/armv7-linux-androideabi/release/libkdf.a
-          zip $NAME target/armv7-linux-androideabi/release/libkdf.a   -j
-          SAFE_DIR_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          mkdir $SAFE_DIR_NAME
-          mv $NAME ./$SAFE_DIR_NAME/
+          set -euo pipefail
+          name="kdf_${{ needs.metadata.outputs.build_tag }}-android-armv7.zip"
+          mkdir -p dist
+          cp target/armv7-linux-androideabi/release/libkdflib.a target/armv7-linux-androideabi/release/libkdf.a
+          zip -j "dist/$name" target/armv7-linux-androideabi/release/libkdf.a
+          (cd dist && sha256sum "$name" > "$name.sha256")
 
-      - name: Upload build artifact
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kdf-android-armv7
+          path: dist/*
+          if-no-files-found: error
+
+  wasm:
+    name: Web WASM bundle
+    runs-on: ubuntu-latest
+    container: komodoofficial/ci-container:latest
+    needs: [metadata, quality-gate]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KDF_SOURCE_REF }}
+
+      - name: Prepare CI container
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "/bin" >> "$GITHUB_PATH"
+          echo "/usr/bin" >> "$GITHUB_PATH"
+          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --no-self-update --profile=minimal
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+
+      - name: Install build deps
+        uses: ./.github/actions/deps-install
+        with:
+          deps: ('protoc')
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: wasm-pack build --release mm2src/mm2_bin_lib --target web --out-dir ../../target/target-wasm-release
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="kdf_${{ needs.metadata.outputs.build_tag }}-wasm.zip"
+          mkdir -p dist
+          (cd target/target-wasm-release && zip -r "$GITHUB_WORKSPACE/dist/$name" .)
+          (cd dist && sha256sum "$name" > "$name.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kdf-wasm
+          path: dist/*
+          if-no-files-found: error
+
+  github-release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs:
+      - metadata
+      - linux-x86-64
+      - mac-universal
+      - win-x86-64
+      - ios-aarch64
+      - android-aarch64
+      - android-armv7
+      - wasm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KDF_SOURCE_REF }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kdf-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Build release manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          find release-assets -maxdepth 1 -type f | sort
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path("release-assets")
+          assets = []
+          for path in sorted(root.iterdir()):
+              if not path.is_file() or path.name.endswith(".sha256"):
+                  continue
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              assets.append({
+                  "name": path.name,
+                  "sha256": digest,
+                  "size": path.stat().st_size,
+              })
+
+          manifest = {
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "commit": "${{ needs.metadata.outputs.source_sha }}",
+              "kdf_version": "${{ needs.metadata.outputs.kdf_version }}",
+              "build_tag": "${{ needs.metadata.outputs.build_tag }}",
+              "release_tag": "${{ needs.metadata.outputs.release_tag }}",
+              "assets": assets,
+          }
+          (root / "kdf-release-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Create release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "Automated KDF build for commit \`${{ needs.metadata.outputs.source_sha }}\`."
+            echo
+            echo "KDF version: \`${{ needs.metadata.outputs.kdf_version }}\`"
+            echo "Build tag: \`${{ needs.metadata.outputs.build_tag }}\`"
+            echo
+            echo "Published assets:"
+            find release-assets -maxdepth 1 -type f -name '*.zip' -printf '- `%f`\n' | sort
+            echo
+            echo "Use the matching \`.sha256\` files or \`kdf-release-manifest.json\` when updating the Flutter SDK build config."
+          } > release-notes.md
+
+      - name: Create or update GitHub release
         env:
-          FILE_SERVER_HOST: ${{ secrets.FILE_SERVER_HOST }}
-          FILE_SERVER_USERNAME: ${{ secrets.FILE_SERVER_USERNAME }}
-          FILE_SERVER_PORT: ${{ secrets.FILE_SERVER_PORT }}
-          FILE_SERVER_KEY: ${{ secrets.FILE_SERVER_KEY }}
-        if: ${{ env.FILE_SERVER_KEY != '' }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          RELEASE_NAME: ${{ needs.metadata.outputs.release_name }}
+        shell: bash
         run: |
-          SAFE_BRANCH_NAME=$(echo "$BRANCH_NAME" | tr '/' '-')
-          python3 ./scripts/ci/upload_artifact.py "$SAFE_BRANCH_NAME" "/uploads/$SAFE_BRANCH_NAME"
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+            gh release edit "$RELEASE_TAG" \
+              --title "$RELEASE_NAME" \
+              --notes-file release-notes.md \
+              --latest
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --title "$RELEASE_NAME" \
+              --notes-file release-notes.md \
+              --target "${{ needs.metadata.outputs.source_sha }}" \
+              --latest
+          fi
