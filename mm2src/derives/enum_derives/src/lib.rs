@@ -106,16 +106,14 @@ pub fn enum_from_trait(input: TokenStream) -> TokenStream {
 ///     Bar(String),
 /// }
 ///
-/// fn main() {
-///     let num = 6500u64;
-///     let expected: FooBar = num.into();
-///     assert_eq!(FooBar::Bar(num.to_string()), expected);
+/// let num = 6500u64;
+/// let expected: FooBar = num.into();
+/// assert_eq!(FooBar::Bar(num.to_string()), expected);
 ///
-///     let err = Error::new(ErrorKind::Other, "oh no!");
-///     let actual = FooBar::Bar(err.to_string());
-///     let expected: FooBar = err.into();
-///     assert_eq!(actual, expected);
-/// }
+/// let err = Error::new(ErrorKind::Other, "oh no!");
+/// let actual = FooBar::Bar(err.to_string());
+/// let expected: FooBar = err.into();
+/// assert_eq!(actual, expected);
 ///  ```
 #[proc_macro_derive(EnumFromStringify, attributes(from_stringify))]
 pub fn derive(input: TokenStream) -> TokenStream {
@@ -143,16 +141,14 @@ pub fn derive(input: TokenStream) -> TokenStream {
 ///     Polygon,
 /// }
 ///
-/// fn main() {
-///     let all_chains = Chain::variant_list();
-///     assert_eq!(all_chains, vec![
-///         Chain::Avalanche,
-///         Chain::Bsc,
-///         Chain::Eth,
-///         Chain::Fantom,
-///         Chain::Polygon
-///     ]);
-/// }
+/// let all_chains = Chain::variant_list();
+/// assert_eq!(all_chains, vec![
+///     Chain::Avalanche,
+///     Chain::Bsc,
+///     Chain::Eth,
+///     Chain::Fantom,
+///     Chain::Polygon
+/// ]);
 /// ```
 #[proc_macro_derive(EnumVariantList)]
 pub fn enum_variant_list(input: TokenStream) -> TokenStream {
