@@ -21,6 +21,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_VERSION: 1.90.0
+  RUSTUP_TOOLCHAIN: 1.90.0
   KDF_SOURCE_REF: ${{ github.event.inputs.kdf_ref || github.sha }}
 
 jobs:
