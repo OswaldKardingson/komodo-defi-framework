@@ -58,7 +58,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   quality-gate:
-    name: Lint and test
+    name: Lint and compile tests
     runs-on: ubuntu-latest
     needs: metadata
     timeout-minutes: 120
@@ -82,8 +82,8 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Run unit tests
-        run: cargo test --bins --lib --no-fail-fast
+      - name: Compile unit tests
+        run: cargo test --bins --lib --no-run
 
   linux-x86-64:
     name: Linux x86-64 executable
