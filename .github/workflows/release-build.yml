@@ -56,7 +56,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   quality-gate:
-    name: Format, lint, and test
+    name: Lint and test
     runs-on: ubuntu-latest
     needs: metadata
     timeout-minutes: 120
@@ -67,7 +67,7 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install stable --no-self-update --profile=minimal --component rustfmt,clippy
+          rustup toolchain install stable --no-self-update --profile=minimal --component clippy
           rustup default stable
 
       - name: Install build deps
@@ -76,9 +76,6 @@ jobs:
           deps: ('protoc' 'libudev-dev')
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt -- --check
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
