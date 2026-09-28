@@ -62,6 +62,7 @@ runs:
 
 
     - name: Download protoc (Windows)
+      if: runner.os == 'Windows' && contains(inputs.deps, 'protoc')
       uses: ./.github/actions/download-and-verify
       with:
         url: "https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-win64.zip"
