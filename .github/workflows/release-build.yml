@@ -133,6 +133,56 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  linux-arm64:
+    name: Linux ARM64 executable
+    runs-on: ubuntu-22.04-arm
+    needs: [metadata, quality-gate]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KDF_SOURCE_REF }}
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --no-self-update --profile=minimal
+          rustup default ${{ env.RUST_VERSION }}
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential libudev-dev libssl-dev pkg-config
+
+      - name: Install protoc
+        uses: ./.github/actions/deps-install
+        with:
+          deps: ('protoc')
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --locked --release --package mm2_bin_lib
+
+      - name: Verify native executable
+        run: |
+          test -x target/release/kdf
+          readelf -h target/release/kdf | grep -Eq 'Machine:.*AArch64'
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="kdf_${{ needs.metadata.outputs.build_tag }}-linux-arm64.zip"
+          mkdir -p dist
+          zip -j "dist/$name" target/release/kdf
+          (cd dist && sha256sum "$name" > "$name.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kdf-linux-arm64
+          path: dist/*
+          if-no-files-found: error
+
   mac-x86-64:
     name: macOS x86-64 executable
     runs-on: macos-latest
@@ -489,6 +539,7 @@ jobs:
     needs:
       - metadata
       - linux-x86-64
+      - linux-arm64
       - mac-universal
       - win-x86-64
       - ios-aarch64
